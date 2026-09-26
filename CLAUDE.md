@@ -41,7 +41,11 @@ Note: the Bash tool's default `python` is the global 3.10 install, which lacks `
 
 ## Architecture: the cycle
 
-One cycle (`pipeline.run_cycle`, every `CLEANER_CYCLE_INTERVAL_H` hours, default 12) in a fixed order — the order is load-bearing, see the `pipeline.py` module docstring:
+Two cadences share one sequential event loop in `service.cycle_loop` (never run concurrently, so `pipeline._last_full_fetch` needs no lock):
+- **Full cycle** (`pipeline.run_cycle`, every `CLEANER_CYCLE_INTERVAL_H` hours, default 12) — fetches the whole collector table, diffs, runs rules, submits new batches, publishes.
+- **Ingest tick** (`pipeline.run_ingest_tick`, every `CLEANER_INGEST_TICK_S` seconds, default 300) — between full cycles, checks pending OpenAI batches (a free API call) and publishes immediately if any completed, reusing the full cycle's last fetched rows (no extra collector call, same staleness contract). Without this, a batch that finishes in 10 minutes would sit unpublished for up to `CLEANER_CYCLE_INTERVAL_H` hours since only the full cycle used to check batch status.
+
+The full cycle's fixed order — the order is load-bearing, see the `pipeline.py` module docstring:
 
 1. **Ingest completed OpenAI batches first** (`ingest_completed_batches`). Batches are async (24h window), so a previous run's batch is usually still in flight. Must run before submitting new work so listings aren't double-sent.
 2. **Fetch + diff against the collector** by `content_hash` over only the fields that affect the verdict (title, description, renovation, dorm flag, area, rooms) — **not** price, `last_seen_at`, or photos. Keeps the AI from re-processing listings whose price merely changed.

@@ -37,6 +37,14 @@ import verdicts_api
 
 CYCLE_INTERVAL_S = float(os.environ.get("CLEANER_CYCLE_INTERVAL_H", "12")) * 3600
 
+# Между полными циклами дополнительно проверяем, не досчитал ли уже
+# OpenAI batch — см. pipeline.run_ingest_tick. Полный цикл (дифф по
+# всей базе коллектора + отправка новых batch) дорог и нужен редко;
+# проверка готовности уже отправленного — бесплатна, и незачем
+# заставлять потребителя ждать до 12 часов результат, который может
+# быть готов через 10 минут.
+INGEST_TICK_INTERVAL_S = float(os.environ.get("CLEANER_INGEST_TICK_S", "300"))
+
 
 def _port():
     """Render задаёт порт через PORT и ожидает, что сервис слушает именно его.
@@ -59,20 +67,40 @@ def setup_logging():
 
 
 async def cycle_loop(stop_event):
+    """Один и тот же цикл событий по очереди делает полный проход
+    (run_cycle, раз в CLEANER_CYCLE_INTERVAL_H) и лёгкие проверки
+    готовности batch между ними (run_ingest_tick, каждые
+    CLEANER_INGEST_TICK_S). Последовательный await на to_thread —
+    полный цикл и тик никогда не выполняются одновременно, поэтому
+    pipeline._last_full_fetch можно безопасно читать/писать без блокировок.
+    """
     log = logging.getLogger("service")
+    last_full = 0.0
     while not stop_event.is_set():
-        log.info("▶️  цикл очистки — старт")
-        started = time.time()
-        try:
-            result = await asyncio.to_thread(pipeline.run_cycle)
-            verdicts_api.record_cycle_result(result)
-            log.info("⏹  цикл завершён за %.0fс: %s", time.time() - started, result)
-        except Exception:
-            log.exception("💥 цикл упал с ошибкой")
-            verdicts_api.record_cycle_result({"error": "cycle_exception"})
+        if time.time() - last_full >= CYCLE_INTERVAL_S:
+            log.info("▶️  цикл очистки — старт")
+            started = time.time()
+            try:
+                result = await asyncio.to_thread(pipeline.run_cycle)
+                verdicts_api.record_cycle_result(result)
+                log.info("⏹  цикл завершён за %.0fс: %s", time.time() - started, result)
+            except Exception:
+                log.exception("💥 цикл упал с ошибкой")
+                verdicts_api.record_cycle_result({"error": "cycle_exception"})
+            last_full = time.time()
+        else:
+            try:
+                result = await asyncio.to_thread(pipeline.run_ingest_tick)
+                if result:
+                    verdicts_api.record_cycle_result(result)
+                    log.info("⚡ промежуточная проверка batch: %s", result)
+            except Exception:
+                log.exception("💥 промежуточная проверка batch упала с ошибкой")
 
         try:
-            await asyncio.wait_for(stop_event.wait(), timeout=CYCLE_INTERVAL_S)
+            timeout = INGEST_TICK_INTERVAL_S if time.time() - last_full < CYCLE_INTERVAL_S \
+                else CYCLE_INTERVAL_S
+            await asyncio.wait_for(stop_event.wait(), timeout=timeout)
         except asyncio.TimeoutError:
             pass
 

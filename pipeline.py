@@ -484,6 +484,45 @@ def publish_clean_baseline(conn, rows, version):
     return {"published": len(clean), "rejected": rejected, "waiting": waiting}
 
 
+# Снимок коллектора из последнего ПОЛНОГО цикла — используется
+# run_ingest_tick(), чтобы публиковать между полными циклами без
+# лишнего похода к коллектору. Свежесть та же, что и раньше (до
+# CLEANER_CYCLE_INTERVAL_H): тик не читает более новые данные, он лишь
+# не заставляет ждать следующего полного цикла, если batch уже посчитан.
+_last_full_fetch = {"version": None, "rows": None}
+
+
+def run_ingest_tick():
+    """Лёгкая проверка готовых batch-заданий МЕЖДУ полными циклами (см.
+    CLEANER_INGEST_TICK_S в service.py). Не ходит к коллектору и не
+    отправляет новые batch — только забирает готовое и, если что-то
+    забрал, пересобирает снимок. Возвращает None, если делать нечего
+    (нет ожидающих batch, либо результатов ещё нет).
+
+    ПОЧЕМУ ЭТО ОТДЕЛЬНАЯ ФУНКЦИЯ, А НЕ КОРОЧЕ ИНТЕРВАЛ run_cycle.
+    Полный цикл дорог не тем, что проверяет batch (это бесплатно), а
+    тем, что тянет ВСЮ таблицу коллектора и гоняет дифф по ней —
+    незачем делать это каждые 5 минут. Проверка же статуса batch у
+    OpenAI ничего не стоит и не имеет смысла ждать 12 часов: провайдер
+    иногда считает за минуты, и тогда потребитель ждал бы результат
+    зря почти целый цикл.
+    """
+    rows = _last_full_fetch["rows"]
+    if rows is None:
+        return None  # ещё не было ни одного полного цикла — ждём его
+
+    with cleaner_db.connect() as conn:
+        if not cleaner_db.pending_batches(conn):
+            return None
+        ingested = ingest_completed_batches(conn, fresh_rows=rows)
+        if not ingested:
+            return None
+        overridden, reopened = apply_rules_to_known(conn, rows)
+        published = publish_clean_baseline(conn, rows, _last_full_fetch["version"])
+        return {"tick": True, "ingested": ingested, "rules_overridden": overridden,
+                "rules_reopened": reopened, **published}
+
+
 def run_cycle():
     """Один полный цикл: собрать готовое, найти новое, разложить по
     слоям, отправить остаток, опубликовать чистый baseline.
@@ -501,6 +540,11 @@ def run_cycle():
             # Снимок не трогаем: без свежих строк коллектора пересобрать его
             # нечем, а прежний остаётся корректным — просто на цикл старее.
             return {"ingested": ingested, "error": "collector_unavailable"}
+
+        # Кэш для run_ingest_tick() — обновляем сразу после успешного
+        # получения снимка, до любых веток, которые могут прерваться.
+        _last_full_fetch["version"] = version
+        _last_full_fetch["rows"] = rows
 
         ingested = ingest_completed_batches(conn, fresh_rows=rows)
 
