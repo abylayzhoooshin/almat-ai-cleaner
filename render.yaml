@@ -23,7 +23,7 @@ services:
   - type: web
     runtime: docker
     name: rieltor-cleaner-almaty
-    region: frankfurt         # тот же регион, что у коллектора — меньше задержка между ними
+    region: singapore         # тот же регион, что у коллектора — меньше задержка между ними
     plan: starter              # минимальный тариф, на котором вообще доступен диск
     numInstances: 1            # с диском горизонтальное масштабирование и так запрещено
 
