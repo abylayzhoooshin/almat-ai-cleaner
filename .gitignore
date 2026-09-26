@@ -1,0 +1,32 @@
+# Локальные секреты. env.ps1 хранит боевые ключи OpenAI и коллектора —
+# в репозиторий он попасть не должен ни при каких обстоятельствах.
+.env
+.env.*
+env.ps1
+run.ps1
+*.pem
+*.key
+
+# Данные рантайма: база вердиктов и всё, что вокруг неё.
+data/
+*.db
+*.db-wal
+*.db-shm
+
+# Выгрузки и артефакты ручных прогонов.
+*.csv
+*.jsonl
+review*.json
+meta.json
+*.log
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+
+# IDE и ОС
+.idea/
+.vscode/
+.DS_Store
