@@ -1,0 +1,32 @@
+.git/
+.gitignore
+.dockerignore
+
+# Секреты и локальные скрипты запуска — в образе им делать нечего.
+.env
+.env.*
+env.ps1
+run.ps1
+*.pem
+*.key
+
+# Локальная база не должна попасть в образ: на Render она живёт на диске,
+# и копия из образа перекрыла бы примонтированный том.
+data/
+*.db
+*.db-wal
+*.db-shm
+
+*.csv
+*.jsonl
+*.log
+*.md
+
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+
+.idea/
+.vscode/
+.DS_Store
