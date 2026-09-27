@@ -518,6 +518,19 @@ def run_ingest_tick():
         if not ingested:
             return None
         overridden, reopened = apply_rules_to_known(conn, rows)
+
+        # Та же защита, что и в run_cycle: пока перепрогон (CLEANER_RELABEL_GEN)
+        # не закончен, снимок НЕ трогаем. Иначе тик опубликовал бы урезанный
+        # снимок из уже пересчитанных объявлений вместо полного прежнего —
+        # то есть подменил бы хорошую опубликованную базу на огрызок прямо
+        # посреди перепрогона.
+        left = cleaner_db.relabel_remaining(conn)
+        if left:
+            log.info("тик: перепрогон не закончен (осталось %s) — снимок не трогаем", left)
+            return {"tick": True, "ingested": ingested, "rules_overridden": overridden,
+                    "rules_reopened": reopened, "publish_skipped": "relabel_in_progress",
+                    "waiting": left}
+
         published = publish_clean_baseline(conn, rows, _last_full_fetch["version"])
         return {"tick": True, "ingested": ingested, "rules_overridden": overridden,
                 "rules_reopened": reopened, **published}
