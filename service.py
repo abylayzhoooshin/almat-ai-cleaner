@@ -46,6 +46,19 @@ CYCLE_INTERVAL_S = float(os.environ.get("CLEANER_CYCLE_INTERVAL_H", "12")) * 360
 INGEST_TICK_INTERVAL_S = float(os.environ.get("CLEANER_INGEST_TICK_S", "300"))
 
 
+class _HideHealthAccessLog(logging.Filter):
+    """Убирает успешный healthcheck, но оставляет 4xx/5xx для диагностики."""
+
+    def filter(self, record):
+        args = record.args
+        if isinstance(args, tuple) and len(args) >= 3 and args[1] == "GET":
+            is_health = str(args[2]).split("?", 1)[0] == "/health"
+            status = args[4] if len(args) >= 5 else None
+            return not (is_health and status == 200)
+        message = record.getMessage()
+        return not ('"GET /health ' in message and ' 200' in message)
+
+
 def _port():
     """Render задаёт порт через PORT и ожидает, что сервис слушает именно его.
 
@@ -117,6 +130,9 @@ async def main():
         port=_port(),
         log_level="info",
     )
+    # Uvicorn настраивает свои logger-ы внутри Config, поэтому фильтр нужно
+    # ставить после создания Config, иначе его может стереть log_config.
+    logging.getLogger("uvicorn.access").addFilter(_HideHealthAccessLog())
     server = uvicorn.Server(config)
     server.install_signal_handlers = lambda: None
 
@@ -136,6 +152,12 @@ async def main():
         "🚀 rieltor-cleaner запущен. API на :%s, цикл очистки каждые %.0fч.",
         config.port, CYCLE_INTERVAL_S / 3600,
     )
+    if verdicts_api.API_ONLY:
+        log.warning(
+            "CLEANER_API_ONLY=1: HTTP API запущен, полный цикл и ingest tick отключены"
+        )
+        await server.serve()
+        return
     if pipeline.PILOT_LIMIT:
         log.warning(
             "ВНИМАНИЕ: включён PILOT_LIMIT=%s — в ИИ уйдёт не больше этого числа "

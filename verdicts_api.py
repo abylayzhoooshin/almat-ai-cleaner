@@ -31,6 +31,9 @@ from fastapi.responses import JSONResponse, Response
 import cleaner_db
 
 API_KEY = os.environ.get("CLEANER_API_KEY", "").strip()
+API_ONLY = os.environ.get("CLEANER_API_ONLY", "").strip().lower() in {
+    "1", "true", "yes", "on",
+}
 MAX_PAGE_SIZE = 500
 DEFAULT_PAGE_SIZE = 200
 
@@ -224,6 +227,9 @@ def health():
     """Как и у коллектора: не 503 на "ещё не было ни одного цикла" (иначе
     платформа перезапускала бы сервис, который просто ждёт первого
     тика) — 503 только если последний УСПЕШНЫЙ цикл был давно."""
+    if API_ONLY:
+        return JSONResponse({"status": "maintenance", "api_only": True}, status_code=200)
+
     uptime = time.monotonic() - _started_at
     with cleaner_db.connect() as conn:
         raw, updated_at = cleaner_db.get_meta(conn, LAST_CYCLE_KEY)

@@ -257,6 +257,58 @@ pip install -r requirements.txt
 Переменные задать в `env.ps1` (он в `.gitignore`, ключи в репозиторий не
 уедут), запуск — `.\run.ps1`.
 
+### Разовый локальный backfill интерьера
+
+Фотооценка запускается отдельной командой и не входит в обычный цикл Cleaner.
+Сначала сохраните неизменяемый clean baseline в CSV и проверьте план без сети:
+
+```powershell
+.venv\Scripts\python.exe backfill_interior_scores.py `
+  --input data\almaty_frozen.csv `
+  --output data\almaty_enriched.csv `
+  --db data\interior.sqlite3 `
+  --report data\interior_report.json `
+  --concurrency 1 --dry-run
+```
+
+Платный smoke-run требует отдельный `RENOVATION_OPENAI_API_KEY` и явный
+`--execute`. Начинайте с одного ID; повтор той же команды должен показать
+ноль новых API attempts:
+
+```powershell
+$env:RENOVATION_OPENAI_API_KEY = "<отдельный ключ>"
+.venv\Scripts\python.exe backfill_interior_scores.py `
+  --input data\almaty_frozen.csv `
+  --output data\almaty_enriched.csv `
+  --db data\interior.sqlite3 `
+  --report data\interior_report.json `
+  --ids 123456789 --concurrency 1 --execute
+```
+
+Входной CSV команда не меняет. SQLite фиксирует результат после каждой строки,
+а output и JSON-report заменяются атомарно. Полный прогон запускайте только
+после проверки smoke-выборки; несколько процессов на одной SQLite-БД не
+поддерживаются.
+
+Для первичной подготовки соблюдайте последовательность:
+
+1. Вручную остановить остальные процессы, зафиксировать frozen baseline и
+   выполнить первый фото-backfill.
+2. Запустить один цикл сбора и очистки, сохранить новый frozen baseline.
+3. Снова вручную остановить остальные процессы и выполнить фото-backfill нового
+   снимка с той же SQLite-БД.
+4. Проверить отчёт и повторный запуск с нулём новых API attempts.
+5. Только после этого запускать внешний основной orchestrator.
+
+Collector и основной orchestrator находятся вне этого репозитория, поэтому их
+остановка и запуск выполняются отдельно. Backfill не импортируется основным
+сервисом и сам не запускает другие процессы.
+
+Для временного запуска на Render установите `CLEANER_API_ONLY=1`: HTTP API,
+`/health` и Shell будут доступны, но полный цикл Cleaner и ingest tick не
+запустятся. После второго фото-прохода смените значение на `0` и перезапустите
+сервис. В `render.yaml` первый деплой намеренно зафиксирован в API-only режиме.
+
 Проверить, что коллектор и дифф работают, **не тратя денег на OpenAI**:
 временно `MIN_BATCH_SIZE=999999` — цикл дойдёт до отправки и напишет
 «объявлений для ИИ меньше порога».
