@@ -20,6 +20,13 @@ review*.json
 meta.json
 *.log
 
+# Локальный handoff-пакет фотооценки; в рабочий репозиторий не загружается.
+/almaty_cleaner_renovation_handoff_v4.zip
+/ALMATY_CLEANER_*.md
+/ALMATY_CLEANER_PACKAGE_SHA256.txt
+/RENOVATION_SCORER_AUDIT.md
+/requirements_renovation.txt
+
 # Python
 __pycache__/
 *.py[cod]
