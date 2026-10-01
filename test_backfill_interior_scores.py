@@ -199,6 +199,40 @@ class BackfillTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(report["status_counts"], {"ready_with_download_gaps": 1})
         self.assertEqual(report["photos"]["unavailable"], 1)
 
+        def forbidden_fetch(_url):
+            self.fail("unchanged frozen partial row was downloaded again")
+
+        resumed = await run_backfill(
+            self.config(), client=FakeClient(), fetcher=forbidden_fetch
+        )
+        self.assertEqual(resumed["api"]["attempts"], 0)
+        self.assertEqual(resumed["api"]["cache_hits"], 1)
+        self.assertEqual(resumed["photos"]["downloaded"], 0)
+
+    async def test_partial_result_is_reprocessed_when_photo_set_changes(self):
+        first_urls = [PHOTO_ROOT + "ok.jpg", PHOTO_ROOT + "gone.jpg"]
+        write_csv(self.input, [csv_row("partial", first_urls)])
+
+        def partial_fetch(url):
+            if url.endswith("gone.jpg"):
+                raise urllib.error.HTTPError(url, 404, "Not Found", {}, None)
+            return fake_download(url)
+
+        await run_backfill(self.config(), client=FakeClient(), fetcher=partial_fetch)
+        changed_urls = [PHOTO_ROOT + "ok.jpg", PHOTO_ROOT + "replacement.jpg"]
+        write_csv(self.input, [csv_row("partial", changed_urls)])
+        downloads = []
+
+        def counted_fetch(url):
+            downloads.append(url)
+            return fake_download(url)
+
+        client = FakeClient()
+        report = await run_backfill(self.config(), client=client, fetcher=counted_fetch)
+        self.assertEqual(downloads, changed_urls)
+        self.assertEqual(client.responses.calls, 1)
+        self.assertEqual(report["status_counts"], {"ready": 1})
+
     async def test_invalid_photo_urls_marks_only_that_row_as_error(self):
         rows = [
             csv_row("bad", ["https://example.test/not-allowed.jpg"]),

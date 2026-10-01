@@ -329,6 +329,43 @@ def _terminal_for_current_input(store: RenovationStore, row: dict[str, str]) -> 
     return True
 
 
+def _pin_gap_state_to_frozen_input(
+    store: RenovationStore,
+    row: dict[str, str],
+    result: dict[str, Any],
+) -> None:
+    """Make a partial result resumable for this exact frozen photo URL set.
+
+    The reusable worker deliberately leaves ``source_set_key`` empty when one
+    or more downloads failed: outside a frozen backfill, a later call should
+    try the missing photos again. A backfill can run for hours and be resumed,
+    so repeatedly paying for the same partial result on every restart is the
+    wrong tradeoff here. Pin only the listing state to the current frozen
+    input. A later baseline with a changed URL set still gets evaluated.
+    """
+    if result.get("status") != "ready_with_download_gaps":
+        return
+    listing_id = str(row.get("id") or "").strip()
+    source_key = renovation_worker.source_set_key(
+        renovation_worker.parse_photo_urls(row.get("photo_urls"))
+    )
+    state = store.get_listing_state(listing_id)
+    if state is None or state["status"] != "ready_with_download_gaps":
+        return
+    store.save_listing_state(
+        listing_id=listing_id,
+        status=state["status"],
+        evaluation_key=state["evaluation_key"],
+        source_set_key=source_key,
+        photo_url_count=state["photo_url_count"],
+        downloaded_photo_count=state["downloaded_photo_count"],
+        failed_photo_count=state["failed_photo_count"],
+        price=state["last_price"],
+        event_reason=state["event_reason"],
+        error=state["error"],
+    )
+
+
 def _percentile(values: list[float], percentile: float) -> float | None:
     if not values:
         return None
@@ -585,6 +622,20 @@ async def run_backfill(
             progress["aborted"] = aborted
             async with report_lock:
                 _atomic_json(config.report_path, progress)
+                if owns_client:
+                    print(json.dumps({
+                        "event": "backfill_progress",
+                        "processed": completed_rows,
+                        "selected": len(selected),
+                        "remaining": max(0, len(selected) - completed_rows),
+                        "status_counts": summary["status_counts"],
+                        "api_attempts": attempt["attempts"],
+                        "api_failed": attempt["failed"],
+                        "photos_downloaded": downloaded_photos,
+                        "photos_unavailable": unavailable_photos,
+                        "error_rows": summary["status_counts"].get("error", 0),
+                        "elapsed_seconds": progress["elapsed_seconds"],
+                    }, ensure_ascii=False), flush=True)
 
         async def process_row(row: dict[str, str]) -> None:
             nonlocal cache_hits, rows_over_limit, aborted, fatal_error
@@ -604,6 +655,7 @@ async def run_backfill(
                         event_reason="frozen_baseline",
                         fetcher=counted_fetcher,
                     )
+                    _pin_gap_state_to_frozen_input(store, row, result)
                     cache_hits += int(bool(result.get("cache_hit")))
                     return
                 except asyncio.CancelledError:
@@ -651,6 +703,13 @@ async def run_backfill(
                     queue.task_done()
 
         _atomic_json(config.report_path, base_report)
+        if owns_client:
+            print(json.dumps({
+                "event": "backfill_started",
+                "selected": len(selected),
+                "concurrency": config.concurrency,
+                "database": str(config.db_path),
+            }, ensure_ascii=False), flush=True)
         tasks = [asyncio.create_task(worker()) for _ in range(config.concurrency)]
         outcomes = await asyncio.gather(*tasks, return_exceptions=True)
         for outcome in outcomes:
