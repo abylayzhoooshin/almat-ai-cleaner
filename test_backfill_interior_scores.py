@@ -1,19 +1,25 @@
 import asyncio
 import csv
 import hashlib
+import io
 import json
 import os
+import sys
 import tempfile
 import unittest
+from contextlib import redirect_stdout
 import urllib.error
 from pathlib import Path
 from types import SimpleNamespace
 from unittest import mock
 
+import renovation_worker
 from backfill_interior_scores import (
     BackfillConfig,
     FatalAuthorizationError,
     InputValidationError,
+    _exclusive_run_lock,
+    main,
     run_backfill,
 )
 from renovation_store import RenovationStore
@@ -233,6 +239,72 @@ class BackfillTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(client.responses.calls, 1)
         self.assertEqual(report["status_counts"], {"ready": 1})
 
+    async def test_partial_transient_download_failure_is_retried_on_resume(self):
+        urls = [PHOTO_ROOT + "ok.jpg", PHOTO_ROOT + "temporary.jpg"]
+        write_csv(self.input, [csv_row("partial", urls)])
+
+        def first_fetch(url):
+            if url.endswith("temporary.jpg"):
+                raise OSError("temporary CDN failure")
+            return fake_download(url)
+
+        first = await run_backfill(self.config(), client=FakeClient(), fetcher=first_fetch)
+        self.assertEqual(first["status_counts"], {"ready_with_download_gaps": 1})
+        downloads = []
+
+        def recovered_fetch(url):
+            downloads.append(url)
+            return fake_download(url)
+
+        second_client = FakeClient()
+        second = await run_backfill(
+            self.config(), client=second_client, fetcher=recovered_fetch
+        )
+        self.assertEqual(downloads, urls)
+        self.assertEqual(second_client.responses.calls, 1)
+        self.assertEqual(second["status_counts"], {"ready": 1})
+
+    def test_exclusive_lock_rejects_second_process_for_same_database(self):
+        with _exclusive_run_lock(self.db):
+            with self.assertRaisesRegex(RuntimeError, "уже запущен другой backfill"):
+                with _exclusive_run_lock(self.db):
+                    self.fail("second lock unexpectedly acquired")
+
+    async def test_real_client_disables_sdk_retries_and_has_timeout(self):
+        write_csv(self.input, [csv_row("empty")])
+        captured = {}
+
+        class CapturingClient(FakeClient):
+            def __init__(self, **kwargs):
+                super().__init__()
+                captured.update(kwargs)
+
+            async def close(self):
+                return None
+
+        fake_openai = SimpleNamespace(AsyncOpenAI=CapturingClient)
+        with mock.patch.dict(sys.modules, {"openai": fake_openai}):
+            with mock.patch.dict(os.environ, {"RENOVATION_OPENAI_API_KEY": "test-key"}):
+                with redirect_stdout(io.StringIO()):
+                    await run_backfill(self.config())
+        self.assertEqual(captured["max_retries"], 0)
+        self.assertEqual(captured["timeout"], 180.0)
+
+    def test_cli_returns_nonzero_when_report_is_not_clean(self):
+        arguments = [
+            "--input", str(self.input),
+            "--output", str(self.output),
+            "--db", str(self.db),
+            "--report", str(self.report),
+            "--execute",
+        ]
+        with mock.patch(
+            "backfill_interior_scores.run_backfill",
+            new=mock.AsyncMock(return_value={"clean": False}),
+        ):
+            with redirect_stdout(io.StringIO()):
+                self.assertEqual(main(arguments), 2)
+
     async def test_invalid_photo_urls_marks_only_that_row_as_error(self):
         rows = [
             csv_row("bad", ["https://example.test/not-allowed.jpg"]),
@@ -340,6 +412,48 @@ class BackfillTests(unittest.IsolatedAsyncioTestCase):
                 "SELECT status FROM attempts WHERE evaluation_key = 'stale-running-attempt'"
             )]
         self.assertEqual(statuses, ["interrupted"])
+
+    async def test_process_interruption_keeps_completed_rows_for_resume(self):
+        rows = [
+            csv_row("first", [PHOTO_ROOT + "first.jpg"]),
+            csv_row("second", [PHOTO_ROOT + "second.jpg"]),
+        ]
+        write_csv(self.input, rows)
+        original = renovation_worker.process_listing
+        calls = 0
+
+        async def interrupt_after_first(**kwargs):
+            nonlocal calls
+            calls += 1
+            if calls == 2:
+                raise asyncio.CancelledError()
+            return await original(**kwargs)
+
+        with mock.patch(
+            "backfill_interior_scores.renovation_worker.process_listing",
+            side_effect=interrupt_after_first,
+        ):
+            with self.assertRaises(FatalAuthorizationError):
+                await run_backfill(
+                    self.config(), client=FakeClient(), fetcher=fake_download
+                )
+
+        with RenovationStore(self.db) as store:
+            self.assertEqual(store.get_listing_state("first")["status"], "ready")
+
+        resumed_downloads = []
+
+        def counted_fetch(url):
+            resumed_downloads.append(url)
+            return fake_download(url)
+
+        resumed_client = FakeClient()
+        report = await run_backfill(
+            self.config(), client=resumed_client, fetcher=counted_fetch
+        )
+        self.assertEqual(resumed_downloads, [PHOTO_ROOT + "second.jpg"])
+        self.assertEqual(resumed_client.responses.calls, 1)
+        self.assertEqual(report["status_counts"], {"ready": 2})
 
     async def test_repeated_input_adds_zero_attempts_and_downloads(self):
         write_csv(self.input, [csv_row("same", [PHOTO_ROOT + "same.jpg"])])

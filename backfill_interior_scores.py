@@ -20,6 +20,7 @@ import tempfile
 import threading
 import time
 from collections import Counter
+from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -44,6 +45,7 @@ TERMINAL_STATUSES = {
 }
 MAX_CONCURRENCY = 4
 MAX_ROW_ATTEMPTS = 3
+OPENAI_TIMEOUT_SECONDS = 180.0
 
 
 class BackfillError(RuntimeError):
@@ -56,6 +58,42 @@ class InputValidationError(BackfillError):
 
 class FatalAuthorizationError(BackfillError):
     pass
+
+
+@contextmanager
+def _exclusive_run_lock(db_path: Path):
+    """Prevent two CLI backfills from paying for the same rows concurrently."""
+    lock_path = Path(f"{db_path}.run.lock")
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    handle = lock_path.open("a+b")
+    try:
+        if handle.seek(0, os.SEEK_END) == 0:
+            handle.write(b"0")
+            handle.flush()
+        handle.seek(0)
+        try:
+            if os.name == "nt":
+                import msvcrt
+                msvcrt.locking(handle.fileno(), msvcrt.LK_NBLCK, 1)
+            else:
+                import fcntl
+                fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError as exc:
+            raise BackfillError(
+                f"уже запущен другой backfill для базы {db_path}"
+            ) from exc
+        try:
+            yield
+        finally:
+            handle.seek(0)
+            if os.name == "nt":
+                import msvcrt
+                msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
+            else:
+                import fcntl
+                fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+    finally:
+        handle.close()
 
 
 @dataclass(frozen=True)
@@ -345,6 +383,13 @@ def _pin_gap_state_to_frozen_input(
     """
     if result.get("status") != "ready_with_download_gaps":
         return
+    payload = result.get("payload") or {}
+    failures = payload.get("download_failures") or []
+    # A timeout/429/5xx may succeed after a restart, so do not freeze a
+    # degraded result caused by a transient CDN failure. Permanent missing
+    # photos (normally 404/410) are safe to checkpoint for this exact input.
+    if not failures or any(bool(item.get("retryable")) for item in failures):
+        return
     listing_id = str(row.get("id") or "").strip()
     source_key = renovation_worker.source_set_key(
         renovation_worker.parse_photo_urls(row.get("photo_urls"))
@@ -549,7 +594,13 @@ async def run_backfill(
         if not secret:
             raise InputValidationError("для --execute задайте RENOVATION_OPENAI_API_KEY")
         from openai import AsyncOpenAI
-        client = AsyncOpenAI(api_key=secret)
+        # The batch owns its retry policy. SDK retries here would multiply the
+        # three row attempts below and make spend/progress hard to reason about.
+        client = AsyncOpenAI(
+            api_key=secret,
+            max_retries=0,
+            timeout=OPENAI_TIMEOUT_SECONDS,
+        )
         owns_client = True
 
     config.db_path.parent.mkdir(parents=True, exist_ok=True)
@@ -829,13 +880,15 @@ def main(argv: list[str] | None = None) -> int:
         input_cost_per_million=args.input_cost_per_million,
         output_cost_per_million=args.output_cost_per_million,
     )
+    lock = _exclusive_run_lock(config.db_path) if config.execute else nullcontext()
     try:
-        report = asyncio.run(run_backfill(config))
+        with lock:
+            report = asyncio.run(run_backfill(config))
     except (BackfillError, OSError, csv.Error) as exc:
         print(f"ERROR: {_clean_error(exc)}")
         return 1
     print(json.dumps(report, ensure_ascii=False, indent=2))
-    return 0
+    return 0 if report.get("clean") else 2
 
 
 if __name__ == "__main__":
