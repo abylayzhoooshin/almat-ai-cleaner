@@ -39,6 +39,8 @@ import requests
 
 import cleaner_db
 import interior_baseline
+import interior_sync
+import mainrieltor_client
 import collector_client
 import heuristics
 import openai_batch
@@ -478,8 +480,7 @@ def publish_clean_baseline(conn, rows, version):
         return {"published": 0, "rejected": rejected, "waiting": waiting,
                 "publish_skipped": "empty_result"}
 
-    previous_interior = cleaner_db.clean_baseline_interior_map(conn)
-    clean = interior_baseline.enrich_rows(clean, previous_interior)
+    clean = interior_sync.enrich(conn, clean)
     cleaner_db.replace_clean_baseline(conn, clean, version)
     conn.commit()
     log.info("чистый baseline опубликован: %s объявлений (отбраковано %s, ждут разметки %s)",
@@ -562,6 +563,21 @@ def run_cycle():
         _last_full_fetch["version"] = version
         _last_full_fetch["rows"] = rows
 
+        exchange, deliveries = None, []
+        sync_result = {"enabled": False}
+        try:
+            exchange = mainrieltor_client.configured()
+            if exchange:
+                deliveries = exchange.fetch()
+                sync_result = {"enabled": True, "received": len(deliveries)}
+        except mainrieltor_client.ExchangeError as exc:
+            log.warning("interior sync: %s", exc)
+            sync_result = {"error": str(exc)}
+            exchange = None
+        interior_sync.migrate(conn)
+        interior_sync.save(conn, deliveries)
+        conn.commit()
+
         ingested = ingest_completed_batches(conn, fresh_rows=rows)
 
         # После разбора batch и до диффа: правила перебивают ИИ-вердикты
@@ -611,8 +627,17 @@ def run_cycle():
         else:
             published = publish_clean_baseline(conn, rows, version)
 
+        if exchange:
+            try:
+                sync_result.update(interior_sync.acknowledge_published(
+                    conn, exchange, deliveries, rows, published))
+            except mainrieltor_client.ExchangeError as exc:
+                log.warning("interior ACK: %s", exc)
+                sync_result["error"] = str(exc)
+        log.info("interior sync: %s", sync_result)
         return {
             **published,
+            "interior_sync": sync_result,
             "rules_overridden": overridden,
             "rules_reopened": reopened,
             "ingested": ingested,
