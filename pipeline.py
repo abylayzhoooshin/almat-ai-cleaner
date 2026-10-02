@@ -38,6 +38,7 @@ import os
 import requests
 
 import cleaner_db
+import interior_baseline
 import collector_client
 import heuristics
 import openai_batch
@@ -477,6 +478,8 @@ def publish_clean_baseline(conn, rows, version):
         return {"published": 0, "rejected": rejected, "waiting": waiting,
                 "publish_skipped": "empty_result"}
 
+    previous_interior = cleaner_db.clean_baseline_interior_map(conn)
+    clean = interior_baseline.enrich_rows(clean, previous_interior)
     cleaner_db.replace_clean_baseline(conn, clean, version)
     conn.commit()
     log.info("чистый baseline опубликован: %s объявлений (отбраковано %s, ждут разметки %s)",

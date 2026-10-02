@@ -360,6 +360,21 @@ def clean_baseline_page(conn, limit, offset):
     )]
 
 
+def clean_baseline_interior_map(conn):
+    """Compact interior fields from the current snapshot, keyed by listing ID."""
+    from interior_baseline import INTERIOR_FIELDS
+
+    result = {}
+    for listing_id, row_json in conn.execute(
+        "SELECT id, row_json FROM clean_baseline ORDER BY seq"
+    ):
+        row = json.loads(row_json)
+        if not row.get("interior_status"):
+            continue
+        result[str(listing_id)] = {field: row.get(field) for field in INTERIOR_FIELDS}
+    return result
+
+
 # ================================ meta ================================
 
 def set_meta(conn, key, value):
